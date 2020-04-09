@@ -1,0 +1,37 @@
+TaxName,Phylum,hex_color
+Actinomyces,Actinobacteria,#004400
+Actinomyces graevenitzii,Actinobacteria,#007100
+Actinomyces odontolyticus,Actinobacteria,#00a500
+Atopobium parvulum,Actinobacteria,#c4d82e
+Rothia,Actinobacteria,#8ac1be
+Rothia dentocariosa,Actinobacteria,#005352
+Rothia mucilaginosa,Actinobacteria,#3a807e
+Scardovia wiggsiae,Actinobacteria,#00985e
+Alloprevotella,Bacteroidetes,#e64d48
+Bergeyella,Bacteroidetes,#e65f3c
+Capnocytophaga granulosa,Bacteroidetes,#f89b8f
+Capnocytophaga sputigena,Bacteroidetes,#ffc0ad
+Porphyromonas pasteri,Bacteroidetes,#b68373
+Prevotella,Bacteroidetes,#ea2a00
+Prevotella melaninogenica,Bacteroidetes,#d40400
+Prevotella pallens,Bacteroidetes,#af0000
+Prevotella salivae,Bacteroidetes,#780000
+Tannerella,Bacteroidetes,#ab3d1f
+Enterococcus,Firmicutes,#875eb3
+Gemella,Firmicutes,#b88ce5
+Granulicatella,Firmicutes,#d8b6f3
+Parvimonas micra,Firmicutes,#f1b6da
+Solobacterium moorei,Firmicutes,#de77ae
+Staphylococcus aureus,Firmicutes,#f3c818
+Staphylococcus haemolyticus,Firmicutes,#e6bb03
+Streptococcus,Firmicutes,#ee8a00
+Streptococcus anginosus,Firmicutes,#d56300
+Veillonella,Firmicutes,#c51b7d
+Veillonella parvula,Firmicutes,#8e0152
+Fusobacterium,Fusobacteria,#2BA9E1
+Leptotrichia,Fusobacteria,#0082EC
+Achromobacter,Proteobacter,#4c809d
+Campylobacter concisus,Proteobacter,#767676
+Pseudomonas,Proteobacter,#18546f
+Mycoplasma wenyonii,Tenericutes,#b7b7b7
+Other,,#dfceb0

@@ -1,0 +1,46 @@
+TaxNameCount,Phylum_sort,Phylum,hex_color
+Actinomyces (ASV29),Actinobacteria,Actinobacteria,#004400
+Actinomyces (ASV43),Actinobacteria,Actinobacteria,#004400
+Actinomyces graevenitzii (ASV26),Actinobacteria,Actinobacteria,#007100
+Actinomyces odontolyticus (ASV9),Actinobacteria,Actinobacteria,#00a500
+Atopobium parvulum (ASV32),Actinobacteria,Actinobacteria,#c4d82e
+Rothia (ASV11),Actinobacteria,Actinobacteria,#8ac1be
+Rothia dentocariosa (ASV37),Actinobacteria,Actinobacteria,#005352
+Rothia mucilaginosa (ASV8),Actinobacteria,Actinobacteria,#3a807e
+Scardovia wiggsiae (ASV48),Actinobacteria,Actinobacteria,#00985e
+Alloprevotella (ASV24),Bacteroidetes,Bacteroidetes,#e64d48
+Alloprevotella (ASV31),Bacteroidetes,Bacteroidetes,#e64d48
+Bergeyella (ASV36),Bacteroidetes,Bacteroidetes,#e65f3c
+Capnocytophaga granulosa (ASV47),Bacteroidetes,Bacteroidetes,#f89b8f
+Capnocytophaga sputigena (ASV49),Bacteroidetes,Bacteroidetes,#ffc0ad
+Porphyromonas pasteri (ASV16),Bacteroidetes,Bacteroidetes,#b68373
+Prevotella (ASV25),Bacteroidetes,Bacteroidetes,#ea2a00
+Prevotella melaninogenica (ASV6),Bacteroidetes,Bacteroidetes,#d40400
+Prevotella pallens (ASV19),Bacteroidetes,Bacteroidetes,#af0000
+Prevotella salivae (ASV30),Bacteroidetes,Bacteroidetes,#780000
+Tannerella (ASV28),Bacteroidetes,Bacteroidetes,#ab3d1f
+Veillonella (ASV27),Bacteroidetes,Firmicutes,#c51b7d
+Enterococcus (ASV33),Firmicutes,Firmicutes,#875eb3
+Gemella (ASV15),Firmicutes,Firmicutes,#b88ce5
+Granulicatella (ASV14),Firmicutes,Firmicutes,#d8b6f3
+Parvimonas micra (ASV44),Firmicutes,Firmicutes,#f1b6da
+Solobacterium moorei (ASV45),Firmicutes,Firmicutes,#de77ae
+Staphylococcus aureus (ASV20),Firmicutes,Firmicutes,#f3c818
+Staphylococcus haemolyticus (ASV21),Firmicutes,Firmicutes,#e6bb03
+Streptococcus (ASV12),Firmicutes,Firmicutes,#ee8a00
+Streptococcus (ASV17),Firmicutes,Firmicutes,#ee8a00
+Streptococcus (ASV2),Firmicutes,Firmicutes,#ee8a00
+Streptococcus (ASV23),Firmicutes,Firmicutes,#ee8a00
+Streptococcus (ASV39),Firmicutes,Firmicutes,#ee8a00
+Streptococcus (ASV7),Firmicutes,Firmicutes,#ee8a00
+Streptococcus anginosus (ASV46),Firmicutes,Firmicutes,#d56300
+Veillonella (ASV13),FIrmicutes,Firmicutes,#c51b7d
+Veillonella parvula (ASV50),Firmicutes,Firmicutes,#8e0152
+Fusobacterium (ASV3),Fusobacteria,Fusobacteria,#2BA9E1
+Leptotrichia (ASV5),Fusobacteria,Fusobacteria,#0082EC
+Achromobacter (ASV57),Proteobacteria,Proteobacter,#4c809d
+Campylobacter concisus (ASV42),Proteobacteria,Proteobacter,#767676
+Pseudomonas (ASV1),Proteobacteria,Proteobacter,#18546f
+Pseudomonas (ASV4),Proteobacteria,Proteobacter,#18546f
+Mycoplasma wenyonii (ASV40),Tenericutes,Tenericutes,#b7b7b7
+NA,NA,NA,#dfceb0
