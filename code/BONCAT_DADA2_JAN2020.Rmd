@@ -1,0 +1,214 @@
+---
+title: "BONCAT_SEQ_DADA2"
+output: html_notebook
+---
+
+```{r}
+library(dada2); packageVersion("dada2")
+library(phyloseq); packageVersion("phyloseq")
+library(decontam); 
+library(tidyverse)
+library(DECIPHER)
+library(phangorn)
+library(ShortRead)
+```
+```{r}
+path <- "../data/fastq/fastq_JAN2020/cutadapt" #Place where gzipped raw fastq files are kept
+list.files(path)
+```
+
+```{r}
+# Forward and reverse fastq filenames have format: SAMPLENAME_R1_001.fastq and SAMPLENAME_R2_001.fastq
+fnFs <- sort(list.files(path, pattern="_R1_001.fastq", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern="_R2_001.fastq", full.names = TRUE))
+# Extract sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+sample.names <- sapply(strsplit(basename(fnFs), "_S"), `[`, 1)
+sample.names
+```
+# Primer-Trimmed Read Quality Assessment
+```{r}
+plotQualityProfile(fnFs[1:25])
+plotQualityProfile(fnRs[1:25])
+```
+In gray-scale is a heat map of the frequency of each quality score at each base position. The median quality score at each position is shown by the green line, and the quartiles of the quality score distribution by the orange lines. The red line shows the scaled proportion of reads that extend to at least that position (this is more useful for other sequencing technologies, as Illumina reads are typically all the same length, hence the flat red line).
+
+# Filter and trim
+```{r}
+# Place filtered files in filtered/ subdirectory
+filtFs <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(path, "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+```
+```{r}
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, 
+                     truncLen=c(250,200), ## truncLen must be large enough to maintain  20 + biological.length.variation nucleotides of overlap between them.
+                     minLen=175,
+                     maxN=0,#This can't be changed. DADA2 requires no Ns. There shouldn't be because we already filtered for this in the cutadapt step
+                     maxEE=c(2,2), #sets the maximum number of "expected errors" allowed in a read, which is a better filter parameter than averaging quality scores.
+                     rm.phix=TRUE,
+                     compress=TRUE, 
+                     multithread=TRUE) # On Windows set multithread=FALSE
+out
+```
+# Lear Errors
+```{r}
+# Learn Error Rates
+errF <- learnErrors(filtFs, multithread=TRUE)
+errR <- learnErrors(filtRs, multithread=TRUE)
+plotErrors(errF, nominalQ=TRUE) #It is always worthwhile, as a sanity check if nothing else, to visualize the estimated error rates
+```
+The error rates for each possible transition (A→C, A→G, …) are shown. Points are the observed error rates for each consensus quality score. The black line shows the estimated error rates after convergence of the machine-learning algorithm. The red line shows the error rates expected under the nominal definition of the Q-score. Here the estimated error rates (black line) are a good fit to the observed rates (points), and the error rates drop with increased quality as expected. Everything looks reasonable and we proceed with confidence.
+
+Parameter learning is computationally intensive, so by default the learnErrors function uses only a subset of the data (the first 100M bases). If you are working with a large dataset and the plotted error model does not look like a good fit, you can try increasing the nbases parameter to see if the fit improves.
+#Dereplication
+Dereplication combines all identical sequencing reads into into “unique sequences” with a corresponding “abundance” equal to the number of reads with that unique sequence. Dereplication substantially reduces computation time by eliminating redundant comparisons.
+
+Dereplication in the DADA2 pipeline has one crucial addition from other pipelines: DADA2 retains a summary of the quality information associated with each unique sequence. The consensus quality profile of a unique sequence is the average of the positional qualities from the dereplicated reads. These quality profiles inform the error model of the subsequent sample inference step, significantly increasing DADA2’s accuracy.
+```{r}
+derepFs <- derepFastq(filtFs, verbose=FALSE)
+derepRs <- derepFastq(filtRs, verbose=FALSE)
+# Name the derep-class objects by the sample names
+names(derepFs) <- sample.names
+names(derepRs) <- sample.names
+```
+
+# Sample inference
+What DADA2 is known for: https://www.nature.com/articles/nmeth.3869#methods
+```{r}
+dadaFs <- dada(derepFs, err=errF, multithread=TRUE)
+dadaRs <- dada(derepRs, err=errR, multithread=TRUE)
+```
+
+# Merge paired reads
+We now merge the forward and reverse reads together to obtain the full denoised sequences. Merging is performed by aligning the denoised forward reads with the reverse-complement of the corresponding denoised reverse reads, and then constructing the merged “contig” sequences. By default, merged sequences are only output if the forward and reverse reads overlap by at least 12 bases, and are identical to each other in the overlap region.
+```{r}
+mergers <- mergePairs(dadaFs, derepFs, dadaRs, derepRs, verbose=TRUE)
+# Inspect the merger data.frame from the first sample
+head(mergers[[1]])
+```
+The mergers object is a list of data.frames from each sample. Each data.frame contains the merged $sequence, its abundance, and the indices of the forward and reverse sequence variants that were merged. Paired reads that did not exactly overlap were removed by  mergePairs, further reducing spurious output.
+
+# Construct sequence table
+We can now construct an amplicon sequence variant table (ASV) table, a higher-resolution version of the OTU table produced by traditional methods.
+```{r}
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+# Inspect distribution of sequence lengths
+table(nchar(getSequences(seqtab)))
+```
+## Explore distribution of sequence sizes
+Look at the reads and read sizes graphically:
+```{r}
+table <- as.data.frame(table(nchar(colnames(seqtab))))
+colnames(table) <- c("LENGTH","COUNT")
+
+ggplot(table,aes(x=LENGTH,y=COUNT)) + 
+  geom_histogram(stat="identity") + 
+  ggtitle("Sequence Lengths by SEQ Count") +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90,hjust=1,vjust=0.5,size=10)) +
+  theme(axis.text.y=element_text(size=10))
+
+table2 <- tapply(colSums(seqtab), nchar(colnames(seqtab)), sum)
+table2 <- data.frame(key=names(table2), value=table2)
+
+colnames(table2) <- c("LENGTH","ABUNDANCE")
+
+ggplot(table2,aes(x=LENGTH,y=ABUNDANCE)) + 
+  geom_histogram(stat="identity") + 
+  ggtitle("Sequence Lengths by SEQ Abundance") +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90,hjust=1,vjust=0.5,size=10)) +
+  theme(axis.text.y=element_text(size=10))
+```
+Define the lengths of the target sequences. Based on our trimming, we are looking at a size range of 251-255
+```{r}
+# Filter out all sequences not within length 250-255 bp
+MINLEN <- 251
+MAXLEN <- 255
+seqtab.filt <- seqtab[ ,nchar(colnames(seqtab)) %in% seq (MINLEN,MAXLEN)]
+table(nchar(getSequences(seqtab.filt)))
+```
+# Remove Chimeras
+```{r}
+# Remove chimeras
+seqtab.nochim <- removeBimeraDenovo(seqtab.filt, method="consensus", multithread=TRUE)
+table(nchar(getSequences(seqtab.nochim)))
+```
+```{r}
+dim(seqtab.filt)
+dim(seqtab.nochim)
+sum(seqtab.nochim)/sum(seqtab.filt)
+```
+```{r}
+saveRDS(seqtab.nochim, "../data/DADA2/seqtab_JAN2020.rds")
+```
+#Track reads through pipeline
+As a final check of our progress, we’ll look at the number of reads that made it through each step in the pipeline:
+```{r}
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtab.nochim))
+# If processing a single sample, remove the sapply calls: e.g. replace sapply(dadaFs, getN) with getN(dadaFs)
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+head(track)
+write.csv(track, "../data/DADA2/DADAtrack_JAN2020.csv")
+```
+
+```{r}
+track <- read_csv("../data/DADA2/DADAtrack_JAN2020.csv", 
+                  col_names = c("sample_names", "input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim"),
+                  skip = 1)
+avgReads <- track %>%
+  summarize(AverageNoChimReads = mean(nonchim),
+            AverageStartReads = mean(input))
+avgReads
+```
+
+```{r}
+seqtab.nochim <- readRDS("../data/DADA2/seqtab_JAN2020.rds")
+```
+
+
+# Assign Taxonomy
+```{r}
+taxa <- assignTaxonomy(seqtab.nochim, "../data/DADA2/taxonomyTrainingSets/silva_nr_v132_train_set.fa.gz", multithread=TRUE)
+taxa <- addSpecies(taxa, "../data/DADA2/taxonomyTrainingSets/silva_species_assignment_v132.fa.gz")
+```
+```{r}
+taxa.print <- taxa # Removing sequence rownames for display only
+rownames(taxa.print) <- NULL
+head(taxa.print)
+```
+Change Genus naming scheme to get rid of _1, _2 etc in Coryneybacterium and Prevotella names specifically found in SILVA database.
+```{r}
+taxa0 <- as.data.frame(taxa) %>%
+  separate(Genus, into = c("Genus", "Genus_Number"), sep = "\\s*\\_\\s*", remove = TRUE)
+taxa0.mat <- as.matrix(taxa0)
+```
+```{r}
+saveRDS(taxa0.mat, "../data/DADA2/tax_silva_JAN2020.rds")
+```
+
+# Create a phylogenetic tree for use with beta diversity metrics
+```{r}
+# seqtab is the sample:ASV table made in DADA2 - it should contain all samples and ASVs
+seqs <- getSequences(seqtab.nochim)
+names(seqs) <- seqs # This propogates the tip labels of the tree
+alignment <- AlignSeqs(DNAStringSet(seqs), anchor=NA)
+
+phang.align <- phyDat(as(alignment, "matrix"), type="DNA")
+dm <- dist.ml(phang.align)
+treeNJ <- NJ(dm)
+fit = pml(treeNJ, data=phang.align)
+fitGTR <- update(fit, k=4, inv=0.2)
+fitGTR <- optim.pml(fitGTR, model="GTR", optInv=TRUE, optGamma=TRUE,
+                      rearrangement = "stochastic", control = pml.control(trace = 0))
+detach("package:phangorn", unload=TRUE)
+saveRDS(fitGTR, "../data/DADA2/fitGTR_JAN2020.rds")
+```
+
+
+```{r}
+sessionInfo()
+```
+

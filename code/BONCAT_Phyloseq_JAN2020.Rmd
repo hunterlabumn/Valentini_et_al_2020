@@ -1,0 +1,1214 @@
+---
+title: "BONCAT-SEQ: Phyloseq analysis - January 2020"
+output:
+  html_document:
+    #fig_width: 12
+    theme: cosmo
+    toc: yes
+  pdf_document: default
+Author: Sarah Lucas
+---
+```{r include = FALSE}
+library(phyloseq)
+library(tidyverse)
+library(cowplot)
+library(gridExtra)
+library(ggpubr)
+library(vegan)
+library(viridis)
+library(hrbrthemes)
+library(RColorBrewer)
+```
+
+# Load in Data
+Data originated in the BONCAT_Decontam_2020.Rmd Notebook. At this point, sequences have been run through the DADA2 pipeline and decontam has been used to filter out sequences that likely contaminants based on prevalence and frequency compared to the DNA extraction control.
+```{r}
+ps.BONCAT <- readRDS(file = "../data/decontam/ps-decontam_prev5.RData") 
+ps.BONCAT
+```
+
+I'd like to make a taxonomy variable that is useful for plotting and working with that contains a mixture of levels, e.g. genus-species if it exists, and family or whatever the last IDd taxonomy level is if genus-species doesnt exist. This would give me a variable in my taxa table called TaxName for each ASV that is the lowest taxonomy assignment. This will also allow me to give the specific epithet where one exists, as there is no way during many plotting tools to combine genus and species information. I will not necessarily use this level for agglomeration or filtering, as that is adding a bias, for example for taxonomy highly represented in a the SILVA database.
+```{r}
+tax.ps.BONCAT <-  as.data.frame(ps.BONCAT@tax_table@.Data) %>%
+  rownames_to_column('ASV') %>%
+  # Now getting into formatting the taxa so it looks nice and informative in plots
+  mutate(Genus_Species = ifelse(!is.na(Species), str_c(Genus, Species, sep = " "), as.character(Genus))) %>%
+  mutate(Genus_Species2 = ifelse(!is.na(Genus_Species), as.character(Genus_Species), as.character(Family))) %>%
+  mutate(TaxName = ifelse(!is.na(Genus_Species2), as.character(Genus_Species2), as.character(Phylum))) %>%
+  select(ASV, Kingdom, Phylum, Class, Order, Family, Genus, Species, TaxName) %>%
+  mutate(COUNT = str_c("(ASV", 1:n() ,")", sep = "")) %>%
+  mutate(TaxNameCount = str_c(TaxName, COUNT, sep = " ")) %>%
+  column_to_rownames('ASV') %>%
+  as.matrix()
+  
+# add this taxtable back to the phyloseq object
+tax_table(ps.BONCAT) <- tax.ps.BONCAT
+ps.BONCAT
+```
+# Exploring data before filtering
+
+## Sequence Summary
+```{r}
+summary(sample_sums(ps.BONCAT))
+```
+
+## Agglomeration 
+How many unique taxa after multi-level agglomeration (combining ASVs by like-taxonomic assignments)?  
+### TaxName agglomeration
+```{r}
+# How many genera would be present after filtering?
+length(get_taxa_unique(ps.BONCAT, taxonomic.rank = "TaxName"))
+# Species agglomeration without throwing away taxa with no species assignment
+ps.BONCAT.taxname <- tax_glom(ps.BONCAT, taxrank = "TaxName", NArm = FALSE)
+ps.BONCAT.taxname
+```
+207 of 213 could be assigned a "taxname". The data could be reduced from 369 to 221 taxa by combining taxa by the level of taxonomic assignment they have.
+
+### Species agglomeration
+```{r}
+# How many genera would be present after filtering?
+length(get_taxa_unique(ps.BONCAT, taxonomic.rank = "Species"))
+# Species agglomeration without throwing away taxa with no species assignment
+ps.BONCAT.species <- tax_glom(ps.BONCAT, taxrank = "Species", NArm = FALSE)
+ps.BONCAT.species
+```
+There are 80 unique species assigned in this dataset. That actually seems quite low, but we will look at this number again after filtering sequences that have very poor or undesireable taxonomy assignments.
+
+# Filtering Samples
+Remove control samples from the dataset
+```{r}
+ps.BONCAT <- subset_samples(ps.BONCAT, SAMPLE_TYPE != "Control")
+ps.BONCAT
+```
+Drop Samples with less than 1000 seqs
+```{r}
+which(!rowSums(otu_table(ps.BONCAT)) > 1000)
+seqThreshold <- 1000
+ps.BONCAT <- prune_samples(sample_sums(ps.BONCAT) > seqThreshold, ps.BONCAT)
+ps.BONCAT
+```
+No samples were removed for low seq coverage.
+
+# Filtering Taxa
+Sometimes taxa remain after samples are removed. Remove any taxa that have zero sequences associated with them
+```{r}
+MINREADS <- 0
+ps.BONCAT <- filter_taxa(ps.BONCAT, function(x) sum(x) > MINREADS, TRUE)
+ps.BONCAT
+```
+Some essential steps for ensuring quality in the data is to get rid of any very low abundance (frequency) or rare (prevalence) taxa, or any taxa that we know should not be in our analysis. First we do supervised filtering - we decided what gets filtered, Then unsupervised - we filter based on abundance parameters and/or representation in the dataset.
+
+## Supervised Prevalence Filtering
+
+### Specific Taxa filtering
+
+Filter out any taxa that have an unassigned phylum - those aren't really useful to us at this point. At this step, also remove ASVs that are associated with Chloroplast/Mitochondrial 16S.
+```{r}
+#Only want Bacterial Seqs, no chloroplast DNA, no mitochondrial DNA
+filterKingdom = c("Archaea","Eukaryota")  
+filterOrder = "Chloroplast" ##Chloroplast DNA
+filterFamily = "Mitochondria" ## Mitochonidrial DNA
+
+# Create table, number of features for each phyla
+phylum_numbers <- data.frame(table(tax_table(ps.BONCAT)[, "Phylum"], exclude = NULL))
+phylum_numbers
+#filter features with an ambiguous phylum annotation.
+ps.super1 <- subset_taxa(ps.BONCAT, 
+                        !is.na(Phylum) & !Phylum %in% c("", "uncharacterized","Unknown_Phylum") & 
+                          !Kingdom %in% filterKingdom &
+                          !Order %in% filterOrder & 
+                          !Family %in% filterFamily)
+ps.BONCAT
+ps.super1
+```
+We can see here that 29 were removed at this step (Did not have an assigned Phylum, or belonged to Chloroplast/Mitochondrial 16S).
+
+### Prevalence Filtering
+A useful next step is to explore feature (ASV) prevalence in the dataset, which we will define here as the number of samples in which a feature (ASV) appears at least once.
+```{r}
+# Compute prevalence of each feature, store as data.frame
+prevdf = apply(X = otu_table(ps.super1),
+               MARGIN = ifelse(taxa_are_rows(ps.super1), yes = 1, no = 2),
+               FUN = function(x){sum(x > 0)})
+# Add taxonomy and total read counts to this data.frame
+prevdf = data.frame(Prevalence = prevdf,
+                    TotalAbundance = taxa_sums(ps.super1),
+                    tax_table(ps.super1))
+                    #ps.super1@tax_table@.Data) # use with idtaxa
+```
+Take a look graphically at the distribution of ASVs among the different phyla:
+```{r}
+# Subset to the remaining phyla after initial filtering
+prevdf.pv.phylum = subset(prevdf, Phylum %in% get_taxa_unique(ps.super1, "Phylum"))
+ggplot(prevdf.pv.phylum, aes(TotalAbundance, Prevalence / nsamples(ps.super1),color=Phylum)) +
+  # Include a guess for filtering parameter at 0.02
+  geom_hline(yintercept = 0.02, alpha = 0.5, linetype = 2) + geom_point(size = 2, alpha = 0.7) +
+  scale_x_log10() +  xlab("Total Abundance") + ylab("Prevalence [Frac. Samples]") + theme(text = element_text(size=10)) + facet_wrap(~Phylum) + theme(legend.position="none")
+```
+
+Are there phyla that are comprised of mostly low-prevalence features? Compute the total and average prevalences of the features in each phylum:
+```{r}
+#just look at phylum
+prevdf.phylum <- plyr::ddply(prevdf, "Phylum", function(df1){cbind(mean(df1$Prevalence),sum(df1$Prevalence))})
+colnames(prevdf.phylum)[2] <- "mean_feature_prevalence"
+colnames(prevdf.phylum)[3] <- "total_feature_prevalence"
+prevdf.phylum
+```
+Yes. Looks like there are some phyla that have quite low prevalence. Let's filter out any features belonging to phyla that have an average prevalence of just 1, or have features seen less than 10 times in the dataset:
+```{r}
+prevdf.phylum.filt <- filter(prevdf.phylum, mean_feature_prevalence <= 1 | total_feature_prevalence < 10)
+prevdf.phylum.filt
+```
+Remove the features belonging to these phyla in prevdf.phylum.filt from the dataset, creating ps.super2
+```{r}
+# Filter low prevalence samples (supervised - you made this decision by looking at your data)
+# Define phyla to filter - Here I have chosen those phyla that have an average prevalence of 1 OR have a total number of features less than 10.
+filterPhyla = unique(prevdf.phylum.filt$Phylum)
+filterPhyla
+# Filter entries with unidentified Phylum.
+ps.super2 <- subset_taxa(ps.super1, !Phylum %in% filterPhyla)
+ps.super2
+```
+### Prevalence in Control/Input Samples
+
+I also would like to filter taxa that are not in either the input or original samples, then it was likely introduced in the downstream steps.
+```{r}
+# filter samples to just original and input samples
+SAMPLE_TYPE_KEEP_ORI_INPUT = c("Original", "Sort Input")
+ps.oriInput <- subset_samples(ps.super2, SAMPLE_TYPE %in% SAMPLE_TYPE_KEEP_ORI_INPUT)
+```
+```{r}
+# Compute prevalence of each feature, store as data.frame
+prevdf.oriInput = apply(X = otu_table(ps.oriInput),
+               MARGIN = ifelse(taxa_are_rows(ps.oriInput), yes = 1, no = 2),
+               FUN = function(x){sum(x > 0)})
+# Add taxonomy and total read counts to this data.frame
+prevdf.oriInput = data.frame(Prevalence = prevdf.oriInput,
+                    TotalAbundance = taxa_sums(ps.oriInput),
+                    tax_table(ps.oriInput))
+prevdf.oriInput <- rownames_to_column(prevdf.oriInput, "OTU") # added step to get the ASV sequences so we can filter at that level
+```
+```{r}
+prevdf.oriInput.zero.filt <- filter(prevdf.oriInput, Prevalence == 0)
+filterZeroOriInput <- unique(prevdf.oriInput.zero.filt$OTU)
+# Filter out the ASVs (rownames in the tax_table) and create a new dataset
+ps.super3 <- subset_taxa(ps.super2, !rownames(tax_table(ps.super2)) %in% filterZeroOriInput)
+ps.super3
+```
+If we look at the dataframe of taxa with zero reads in ANY of the Original or Input samples, we see that it is a lot of taxa that are not commonly seen in the human respiratory tract, and are likely to be introduced by the downstream processing samples go through. We are left with 117 taxa after these filtering steps. 
+
+Take a look at the prevalence and abundance of the remaining taxa after supervised filtering:
+```{r}
+# Compute prevalence of each feature, store as data.frame
+prevdf.supervised = apply(X = otu_table(ps.super3),
+               MARGIN = ifelse(taxa_are_rows(ps.super3), yes = 1, no = 2),
+               FUN = function(x){sum(x > 0)})
+# Add taxonomy and total read counts to this data.frame
+prevdf.supervised = data.frame(Prevalence = prevdf.supervised,
+                    TotalAbundance = taxa_sums(ps.super3),
+                    tax_table(ps.super3))
+```
+Take a look graphically at the distribution of taxa among the different phyla:
+```{r}
+# Subset to the remaining phyla after initial filtering
+prevdf.supervised.phylum = subset(prevdf.supervised, Phylum %in% get_taxa_unique(ps.super3, "Phylum"))
+ggplot(prevdf.supervised.phylum, aes(TotalAbundance, Prevalence / nsamples(ps.super3),color=Phylum)) +
+  # Include a guess for filtering parameter at 0.02
+  geom_hline(yintercept = 0.02, alpha = 0.5, linetype = 2) + geom_point(size = 2, alpha = 0.7) +
+  scale_x_log10() +  xlab("Total Abundance") + ylab("Prevalence [Frac. Samples]") + theme(text = element_text(size=10)) +
+  facet_wrap(~Phylum, ncol = 4) + theme(legend.position="none")
+```
+
+## Unsupervised filtering
+The previous filtering steps are considered supervised, because they relied on prior information that is external to this experiment (a taxonomic reference database). This next filtering step is completely unsupervised, relying only on the data in this experiment, and a parameter that we will choose after exploring the data. Thus, this filtering step can be applied even in settings where taxonomic annotation is unavailable or unreliable.
+
+I just want to make sure here that the ASVs kept belong to at least 1 sample, and filter anything with a relative abundance less than .001
+```{r}
+#Define prevalence threshold as 5% of total samples
+prevalenceThreshold =  1
+prevalenceThreshold
+# Execute prevalence filter, using `prune_taxa()` function
+keepTaxa <- rownames(prevdf.supervised)[(prevdf.supervised$Prevalence >= prevalenceThreshold)]
+ps.unsuper.prevfilt <- prune_taxa(keepTaxa, ps.super3)
+ps.unsuper.prevfilt
+```
+All taxa were retained at this step.
+
+Transform dataset to proportions
+```{r}
+ps.unsuper.prevfilt.prop <- transform_sample_counts(ps.unsuper.prevfilt, function(x){x / sum(x)})
+ps.unsuper.prevfilt.prop
+```
+Filter taxa that have a relative abundance less than .001
+```{r}
+abundanceThreshold = .001
+ps.unsuper.prevfilt.taxfilt.prop = filter_taxa(ps.unsuper.prevfilt.prop, function(x) mean(x) > abundanceThreshold, TRUE)
+keepTaxaRelAbund <- taxa_names(ps.unsuper.prevfilt.taxfilt.prop)
+
+# Prune the non-transformed dataset
+ps.unsuper.prevfilt.taxfilt <- prune_taxa(keepTaxaRelAbund, ps.unsuper.prevfilt)
+ps.unsuper.prevfilt.taxfilt
+```
+162 low abundance taxa were filtered out from this step. (if the average sequences per sample is 40000, then I am removing taxa with around 4 sequences to their name!)
+
+What does the summary of sequences in this dataset look like now?
+```{r}
+summary(sample_sums(ps.unsuper.prevfilt.taxfilt))
+```
+Still very reasonable read coverage and distribution.
+```{r}
+# Compute prevalence of each feature, store as data.frame
+prevdf.unsupervised = apply(X = otu_table(ps.unsuper.prevfilt.taxfilt),
+               MARGIN = ifelse(taxa_are_rows(ps.unsuper.prevfilt.taxfilt), yes = 1, no = 2),
+               FUN = function(x){sum(x > 0)})
+# Add taxonomy and total read counts to this data.frame
+prevdf.unsupervised = data.frame(Prevalence = prevdf.unsupervised,
+                    TotalAbundance = taxa_sums(ps.unsuper.prevfilt.taxfilt),
+                    tax_table(ps.unsuper.prevfilt.taxfilt))
+```
+Take a look graphically at the distribution of taxa among the different phyla:
+```{r}
+# Subset to the remaining phyla after initial filtering
+prevdf.unsupervised.phylum = subset(prevdf.unsupervised, Phylum %in% get_taxa_unique(ps.unsuper.prevfilt.taxfilt, "Phylum"))
+ggplot(prevdf.unsupervised.phylum, aes(TotalAbundance, Prevalence / nsamples(ps.unsuper.prevfilt.taxfilt),color=Phylum)) +
+  # Include a guess for filtering parameter at 0.02
+  geom_hline(yintercept = 0.02, alpha = 0.5, linetype = 2) + geom_point(size = 2, alpha = 0.7) +
+  scale_x_log10() +  xlab("Total Abundance") + ylab("Prevalence [Frac. Samples]") + theme(text = element_text(size=10)) +
+  facet_wrap(~Phylum, ncol = 4) + theme(legend.position="none")
+```
+Many of the low abundance-low prevalence taxa have been removed.
+
+# Taxa Agglomeration
+## Species agglomeration
+```{r}
+# How many genera would be present after filtering?
+length(get_taxa_unique(ps.unsuper.prevfilt.taxfilt, taxonomic.rank = "Species"))
+# Species agglomeration without throwing away taxa with no species assignment
+ps.filt.species <- tax_glom(ps.unsuper.prevfilt.taxfilt, taxrank = "Species", NArm = FALSE)
+ps.filt.species
+```
+There are 22 unique species in this dataset. the dataset could be further reduced to 36 features with agglomeration at this level.
+
+# Taxa plots
+
+## Plotting settings:
+Set a taxa color palette:
+Specify taxa names and color hex code in this dataframe. They will be applied to melted datasets and give continuity to colors and taxa in plotting.
+```{r}
+newbugcolors <- read_csv("../docs/lowabundcolors.csv")
+#Plotting colors
+bugcolor <- as.character(newbugcolors$hex_color)
+names(bugcolor) <- as.character(newbugcolors$TaxName)
+```
+Plotting labels:
+Set consistent plot breaks and labels so they don't have to be designated in long strings over and over.
+```{r}
+# Make a dataframe containing sample name and sample type variables
+plot.labels <- as.data.frame(sample_data(ps.unsuper.prevfilt.taxfilt)) %>%
+  select(SAMPLE_NAME, SAMPLE_TYPE, PATIENT_NUM, SAMPLE_ORDER) %>%
+  arrange(PATIENT_NUM, SAMPLE_NAME, SAMPLE_ORDER)
+# Designate order of samples in facets
+plot.breaks <- as.vector(plot.labels$SAMPLE_NAME)
+plot.breaks
+# Designate labels of samples in facets
+plot.labels <- as.vector(plot.labels$SAMPLE_TYPE)
+plot.labels
+```
+Filtering parameters
+```{r}
+# taxa under 1% of reads will belong to the Other category in plotting relative abundances
+other.level <- 1 
+# taxa under 1000 reads will belong to the Other category in plotting absolute abundances
+abs.other.level <- 1000 
+# taxa under 1% of reads will belong to the Other category in plotting absolute abundances
+low.other.level <- .5
+# taxa under .1 of log-transformed reads will belong to the Other category
+logabs.other.level <- 6
+```
+
+## Absolute abundance stacked bar graph
+Melt phyloseq datasets for plotting absolute abundances
+```{r}
+ps.filt.abs.melt <- psmelt(ps.unsuper.prevfilt.taxfilt) %>%
+  mutate(TaxName = as.character(TaxName)) %>%
+  select(SAMPLE_NAME, SAMPLE_ORDER, SAMPLE_TYPE, PATIENT_NUM, TaxName, TaxNameCount, Abundance) %>%
+  mutate(TaxNamePlot = ifelse(Abundance < abs.other.level, "Other", TaxName)) %>%
+  left_join(newbugcolors, by = c("TaxNamePlot" = "TaxName"))
+## How many unique names are we dealing with (for plotting)
+unique(ps.filt.abs.melt$TaxNamePlot)
+```
+Make absolute abundance stacked bar graphs
+```{r, fig.height = 5, fig.width = 9.5}
+# Make sure that x is sorted by SAMPLE_ORDER for the breaks and labels to match up.
+BONCAT.barplot.abs <- ggplot(data=ps.filt.abs.melt, aes(x=reorder(SAMPLE_NAME, SAMPLE_ORDER), y=Abundance, fill=TaxNamePlot)) +
+  facet_grid(.~as.factor(PATIENT_NUM), scales = "free_x") +
+  geom_bar(aes(), stat="identity", position="stack") + 
+  theme_classic() + 
+  scale_fill_manual(values = bugcolor) +
+  scale_x_discrete(breaks = plot.breaks,
+                   labels = plot.labels
+                   ) +
+  theme_pubclean(base_size = 10) +
+  theme(
+    legend.position="bottom",
+    legend.text = element_text(size = 8, face = "italic"),
+    legend.title = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.ticks.x = element_blank()) +
+  labs(x = "", y = "Read Abundance")
+BONCAT.barplot.abs
+```
+While the samples are all at a very high level of coverage, there are some differences in number of sequences to keep in mind for other plot types. Still at least in this plot, seqeunce coverage does not seem to related to diversity, but it's hard to tell for sure here.
+```{r}
+ggsave(BONCAT.barplot.abs, 
+       filename = "../figures/phyloseq_JAN2020/BONCAT-barplot-abs.pdf", 
+       device = "pdf",
+      height = 5, width = 9, units = "in")
+```
+
+## Relative abundance stacked bar graph 
+Transform OTU table from species agglomerated object to proportions
+```{r}
+ps.filt.prop <- transform_sample_counts(ps.unsuper.prevfilt.taxfilt, function(x){100 * x / sum(x)})
+```
+melt transformed dataset:
+```{r}
+ps.filt.prop.melt <- psmelt(ps.filt.prop) %>%
+  mutate(TaxName = as.character(TaxName)) %>%
+  select(SAMPLE_NAME, SAMPLE_ORDER, SAMPLE_TYPE, SAMPLE_TYPE_SIMPLE, PATIENT_NUM, TaxName, TaxNameCount, OTU, Abundance) %>%
+  mutate(TaxNamePlot = ifelse(Abundance < other.level, "Other", TaxName)) %>%
+  left_join(newbugcolors, by = c("TaxNamePlot" = "TaxName"))
+## How many unique names are we dealing with (for plotting)
+unique(ps.filt.prop.melt$TaxNamePlot)
+```
+
+Relative abundance stacked bar graph
+```{r fig.height=6, fig.width=10}
+#fig.height = 5, fig.width = 9.5
+# Make sure that x is sorted by SAMPLE_ORDER for the breaks and labels to match up.
+BONCAT.barplot.prop <- ggplot(data=ps.filt.prop.melt, aes(x=reorder(SAMPLE_NAME, SAMPLE_ORDER), y=Abundance, fill=TaxNamePlot)) +
+  facet_grid(.~as.factor(PATIENT_NUM), scales = "free_x") +
+  geom_bar(aes(), stat="identity", position="stack") + 
+  theme_classic() + 
+  scale_fill_manual(values = bugcolor) +
+  scale_x_discrete(breaks = plot.breaks,
+                   labels = plot.labels
+                   ) +
+  theme_pubclean(base_size = 10) +
+  theme(
+    legend.position="bottom",
+    legend.text = element_text(size = 8, face = "italic"),
+    legend.title = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.ticks.x = element_blank()) +
+  labs(x = "", y = "Read Abundance") +
+  guides(fill = guide_legend(keywidth = .8, keyheight = .8))
+BONCAT.barplot.prop
+```
+There appears to pretty consistent, especially in Patient 59. Replicate samples for Patient 62 and 68 have a bit more variability. I need to use ordination on each of these sample groups to show that the replicates group more by sample type than with the Original/Input to be confident I can combine them for further analysis.
+```{r}
+ggsave(plot = BONCAT.barplot.prop,
+       filename = "../figures/phyloseq_JAN2020/BONCAT-barplot-prop.svg", 
+       device = "svg", 
+       height = 5, width = 8.5)
+```
+## Low relative abundance stacked bar graph
+Taxa filtering levels for looking at low abundance populations 
+```{r}
+# Set filtering level to keep taxa at 10% or less.
+low.filt.level <- 10
+```
+Melt transformed dataset
+```{r}
+ps.filt.prop.lowabund.melt <- psmelt(ps.filt.prop) %>%
+  mutate(TaxName = as.character(TaxName)) %>%
+  mutate(TaxNameCount = as.character(TaxNameCount)) %>%
+  filter(Abundance < low.filt.level) %>%
+  select(SAMPLE_NAME, SAMPLE_ORDER, SAMPLE_TYPE, PATIENT_NUM, TaxName, TaxNameCount, Abundance) %>%
+  mutate(TaxNamePlot = ifelse(Abundance < low.other.level, "Other", TaxName)) %>%
+  left_join(newbugcolors, by = c("TaxNamePlot" = "TaxName"))
+## How many unique names are we dealing with (for plotting)
+unique(ps.filt.prop.lowabund.melt$TaxNamePlot)
+```
+```{r, fig.height=6, fig.width=10}
+#fig.height=10, fig.width=10
+lowabund.plot <- ggplot(data=ps.filt.prop.lowabund.melt, aes(x=reorder(SAMPLE_NAME, SAMPLE_ORDER), y=Abundance, fill=TaxNamePlot)) +
+  facet_wrap(~PATIENT_NUM, ncol = 4, scales = "free_x") +
+  geom_bar(aes(), stat="identity", position="stack") + 
+  theme_classic() + 
+  #scale_fill_tech(theme="airbnb") + 
+  scale_fill_manual(values = bugcolor) +
+  scale_x_discrete(breaks = plot.breaks,
+                   labels = plot.labels
+                   ) +
+  theme_pubclean() +
+  theme(
+    legend.position="bottom",
+    legend.text = element_text(size = 8, face = "italic"),
+    legend.title = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.ticks.x = element_blank()) +
+  labs(x = "", y = "Relative Abundance (% reads)") +
+  guides(fill = guide_legend(keywidth = .8, keyheight = .8))
+lowabund.plot
+```
+```{r}
+ggsave(lowabund.plot, filename = "../figures/phyloseq_JAN2020/BONCAT-barplot-prop-lowabund-reps.svg", device = "svg",
+       height = 6, width = 10, unit = "in")
+```
+
+Looking at the low abundance taxa we make room to lower the "Other" category down to 0.5% and we can look at how these low abundance taxa differ.
+
+```{r}
+ggsave(lowabund.plot, 
+       filename = "../figures/phyloseq_JAN2020/BONCAT-barplot-prop-lowabund.pdf", 
+       device = "pdf",
+       height = 8, width = 9, units = "in")
+```
+
+## Average Replicate stacked bar graphs
+```{r}
+ps.filt.prop.melt.merged <- ps.filt.prop.melt %>%
+  group_by(PATIENT_NUM, SAMPLE_TYPE_SIMPLE, TaxName, OTU) %>%
+  summarize(meanAbundance = mean(Abundance),
+            stdevAbundance = sd(Abundance)) %>%
+  mutate(TaxNamePlot = ifelse(meanAbundance < other.level, "Other", TaxName)) %>%
+  filter(!meanAbundance == 0)
+```
+### Filtering for separate graphs for each patient
+```{r}
+ps.filt.prop.melt.merged.59 <- filter(ps.filt.prop.melt.merged, PATIENT_NUM == "Patient_59")
+ps.filt.prop.melt.merged.62 <- filter(ps.filt.prop.melt.merged, PATIENT_NUM == "Patient_62")
+ps.filt.prop.melt.merged.68 <- filter(ps.filt.prop.melt.merged, PATIENT_NUM == "Patient_68")
+```
+
+```{r}
+#fig.height = 5, fig.width = 9.5
+# Make sure that x is sorted by SAMPLE_ORDER for the breaks and labels to match up.
+BONCAT.barplot.prop.merged <- ggplot(data=ps.filt.prop.melt.merged, aes(x=SAMPLE_TYPE_SIMPLE, y=meanAbundance, fill=TaxNamePlot)) +
+  facet_grid(.~as.factor(PATIENT_NUM), scales = "free_x") +
+  geom_bar(aes(), stat="identity", position="stack") + 
+  theme_classic() + 
+  scale_fill_manual(values = bugcolor) +
+  #scale_x_discrete(breaks = c("Original","Input","Sort Positive", "Sort Negative")) +
+  theme_pubclean(base_size = 10) +
+  theme(
+    legend.position="bottom",
+    legend.text = element_text(size = 8, face = "italic"),
+    legend.title = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.ticks.x = element_blank()) +
+  labs(x = "", y = "Read Abundance") +
+  guides(fill = guide_legend(keywidth = .5, keyheight = .5))
+BONCAT.barplot.prop.merged
+```
+Get legend and save it for plotting
+```{r fig.width = 8, fig.height = 1}
+taxaplot_legend <- get_legend(BONCAT.barplot.prop.merged + theme(legend.box.margin = margin(0, 0, 0, 0)))
+legend_plot <- plot_grid(taxaplot_legend)
+legend_plot
+#ggsave(legend_plot, filename = "../figures/phyloseq_JAN2020/taxaplot_legend.svg", device = "svg",
+#       height = 2, width = 9)
+```
+### Average Relative abundance stacked bar graph
+```{r fig.height = 3.5, fig.width = 2.5}
+# Make sure that x is sorted by SAMPLE_ORDER for the breaks and labels to match up.
+BONCAT.barplot.prop.merged.59 <- ggplot(data=ps.filt.prop.melt.merged.59, aes(x=SAMPLE_TYPE_SIMPLE, y=meanAbundance, fill=TaxNamePlot)) +
+  facet_grid(.~as.factor(PATIENT_NUM), scales = "free_x") +
+  geom_bar(aes(), stat="identity", position="stack") + 
+  theme_classic() + 
+  scale_fill_manual(values = bugcolor) +
+  #scale_x_discrete(breaks = c("Original","Input","Sort Positive", "Sort Negative")) +
+  theme_pubclean(base_size = 10) +
+  theme(
+    legend.position="none",
+    legend.text = element_text(size = 8, face = "italic"),
+    legend.title = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.ticks.x = element_blank()) +
+  labs(x = "", y = "Read Abundance")
+BONCAT.barplot.prop.merged.59
+```
+```{r}
+ggsave(BONCAT.barplot.prop.merged.59, filename = "../figures/phyloseq_JAN2020/pt59StackedBar.svg", 
+       device = "svg", height = 3.5, width = 2.5, units = "in")
+```
+
+
+```{r fig.height = 3.5, fig.width = 2.5}
+# Make sure that x is sorted by SAMPLE_ORDER for the breaks and labels to match up.
+BONCAT.barplot.prop.merged.62 <- ggplot(data=ps.filt.prop.melt.merged.62, aes(x=SAMPLE_TYPE_SIMPLE, y=meanAbundance, fill=TaxNamePlot)) +
+  facet_grid(.~as.factor(PATIENT_NUM), scales = "free_x") +
+  geom_bar(aes(), stat="identity", position="stack") + 
+  theme_classic() + 
+  scale_fill_manual(values = bugcolor) +
+  #scale_x_discrete(breaks = c("Original","Input","Sort Positive", "Sort Negative")) +
+  theme_pubclean(base_size = 10) +
+  theme(
+    legend.position="none",
+    legend.text = element_text(size = 8, face = "italic"),
+    legend.title = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.ticks.x = element_blank()) +
+  labs(x = "", y = "Read Abundance")
+BONCAT.barplot.prop.merged.62
+```
+```{r}
+ggsave(BONCAT.barplot.prop.merged.62, filename = "../figures/phyloseq_JAN2020/pt62StackedBar.svg", 
+       device = "svg", height = 3.5, width = 2.5, units = "in")
+```
+
+```{r fig.height = 3.5, fig.width = 2.5}
+# Make sure that x is sorted by SAMPLE_ORDER for the breaks and labels to match up.
+BONCAT.barplot.prop.merged.68 <- ggplot(data=ps.filt.prop.melt.merged.68, aes(x=SAMPLE_TYPE_SIMPLE, y=meanAbundance, fill=TaxNamePlot)) +
+  facet_grid(.~as.factor(PATIENT_NUM), scales = "free_x") +
+  geom_bar(aes(), stat="identity", position="stack") + 
+  theme_classic() + 
+  scale_fill_manual(values = bugcolor) +
+  #scale_x_discrete(breaks = c("Original","Input","Sort Positive", "Sort Negative")) +
+  theme_pubclean(base_size = 10) +
+  theme(
+    legend.position="none",
+    legend.text = element_text(size = 8, face = "italic"),
+    legend.title = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.ticks.x = element_blank()) +
+  labs(x = "", y = "Read Abundance")
+BONCAT.barplot.prop.merged.68
+```
+```{r}
+ggsave(BONCAT.barplot.prop.merged.68, filename = "../figures/phyloseq_JAN2020/pt68StackedBar.svg", 
+       device = "svg", height = 3.5, width = 2.5, units = "in")
+```
+
+### Low abundance taxa stacked bar graph
+```{r}
+ps.filt.prop.melt.merged.lowabund <- ps.filt.prop.melt %>%
+  group_by(PATIENT_NUM, SAMPLE_TYPE_SIMPLE, TaxName, OTU) %>%
+  summarize(meanAbundance = mean(Abundance),
+            stdevAbundance = sd(Abundance)) %>%
+  filter(meanAbundance < low.filt.level) %>%  
+  mutate(TaxNamePlot = ifelse(meanAbundance < low.other.level, "Other", TaxName)) %>%
+  filter(!meanAbundance == 0) # Just get rid of extra rows in the dataframe that are zero
+unique(ps.filt.prop.melt.merged.lowabund$TaxNamePlot)
+```
+
+```{r fig.height=8, fig.width=10.5}
+lowabund.merge.plot <- ggplot(data=ps.filt.prop.melt.merged.lowabund, aes(x=SAMPLE_TYPE_SIMPLE, y=meanAbundance, fill=TaxNamePlot)) +
+  facet_wrap(~PATIENT_NUM, ncol = 4, scales = "free_x") +
+  geom_bar(aes(), stat="identity", position="stack") + 
+  theme_classic() + 
+  #scale_fill_tech(theme="airbnb") + 
+  scale_fill_manual(values = bugcolor) +
+#  scale_x_discrete(breaks = plot.breaks,
+#                   labels = plot.labels
+#                   ) +
+  theme_pubclean() +
+  theme(
+    legend.position="bottom",
+    legend.text = element_text(size = 8, face = "italic"),
+    legend.title = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.ticks.x = element_blank()) +
+  labs(x = "", y = "Relative Abundance (% reads)")
+lowabund.merge.plot
+```
+
+**Observations:**  
+Brevundimonas, Allorhizobium, Pseudoflavitalea, Pannonibacter phragmitetus, Microbacterium, Flavobacterium ceti, and probably some other organisms too are are only seen in all the sort samples, could be from contamination, but we don't have sheath fluid samples to test. This wll become more clear when we break down the datasets into individual patients.
+
+**NOTE:** (2020-01-14): After this observation, I went back the the Supervised Filtering section and filtered out all the taxa that were in NONE of the control or Input samples. This removed all of these organisms from the dataset and they are no longer in the analysis.
+
+# Comparing Differences between samples by type
+
+I want to use different visualization techniques to look at differences between samples, and determine if there are differing taxa between sample types, different amounts/percentages of taxa between sample types. To do most of these analyses we need to split up our dataset by patient number:
+
+We use the dataset with the OTU table transformed to proportions, in order to mitigate any influence of differing sequence numbers.
+Edit: even doing this without transoformation gives the same conclusions.
+
+## Ordination
+
+Split dataset by patient number for individual ordination
+```{r}
+# Filtering parameter for minimum reads
+MINREADS <- 0
+# Split dataset by patient number
+ps.patient59.prop <- subset_samples(ps.filt.prop, PATIENT_NUM == "Patient_59") %>% 
+  filter_taxa(function(x) sum(x) > MINREADS, TRUE)
+ps.patient59.prop
+ps.patient62.prop <- subset_samples(ps.filt.prop, PATIENT_NUM == "Patient_62") %>% 
+  filter_taxa(function(x) sum(x) > MINREADS, TRUE)
+ps.patient62.prop
+ps.patient68.prop <- subset_samples(ps.filt.prop, PATIENT_NUM == "Patient_68") %>% 
+  filter_taxa(function(x) sum(x) > MINREADS, TRUE)
+ps.patient68.prop
+```
+
+Visualization of differences between taxo in Original, Input, Postive, and Negative samples using simple Bray-Curtis and PCoA
+
+```{r}
+ord.colors <- c("#E18D2F", "#EEC537","#28546D", "#8AC1BE", "#3A807E", "#6C2215", "#D7462E", "#EBA194")
+```
+
+Ordination and plotting function:
+```{r}
+DPCoAPlot <- function(x) {
+  #ord <- ordinate(x, "MDS", "wunifrac")
+  ord <- ordinate(x, "DPCoA")
+  p <- plot_ordination(x, ord, color = "SAMPLE_TYPE")
+  p + geom_point(size = 3) + facet_wrap(.~PATIENT_NUM) + theme_pubr() + theme(panel.border = element_rect(color = "black", fill = "transparent", size = 1), axis.line = element_blank(), legend.position = "right", plot.margin = margin(6,6,6,6)) + scale_color_manual(values = ord.colors)
+}
+```
+
+```{r}
+#fig.height = 3, fig.width=9
+ord.prop <- ordinate(ps.filt.prop, "DPCoA")
+plot_ordination(ps.filt.prop, ord.prop, color = "SAMPLE_TYPE", shape = "PATIENT_NUM") + geom_point(size = 4) + theme_pubr() + theme(panel.border = element_rect(color = "black", fill = "transparent", size = 1), axis.line = element_blank(), legend.position = "right", plot.margin = margin(6,6,6,6)) + scale_color_manual(values = ord.colors)
+DPCoAPlot(ps.filt.prop) #(ps.filt.genus.prop)
+```
+When plotted together on the same ordination plot (just faceted by Patient number for readability) I can see that the sample types do in general cluster with each other.  
+
+* Patient 59 has strong grouping of replicates.  
+* Patient 62 has strong grouping of the Positive replicates, quite a bit of variability in the negative samples, with Negative-2 looking like a bit like an outlier.  
+* Patient 68 has strong grouping of negative replicates, and two out of 3 positive replicates with Positive-2 as an outlier.  
+
+Next, I will calculate the ordination for each patient individually to see how much variation exists between samples using the DPCoA method.
+
+```{r fig.height = 3, fig.width = 11}
+ordplot59 <- DPCoAPlot(ps.patient59.prop)
+ordplot62 <- DPCoAPlot(ps.patient62.prop)
+ordplot68 <- DPCoAPlot(ps.patient68.prop)
+grid <- plot_grid(ordplot59 + theme(legend.position="none"),
+                  ordplot62 + theme(legend.position="none"), 
+                  ordplot68 + theme(legend.position="none"),
+                  align = "vh", hjust = -1, nrow = 1)
+# extract the legend from one of the plots
+legend <- get_legend(
+  # create some space to the left of the legend
+  ordplot59 + theme(legend.box.margin = margin(0, 0, 0, 12))
+)
+# add the legend to the row we made earlier. Give it one-third of 
+# the width of one plot (via rel_widths).
+gridLegend <- plot_grid(grid, legend, rel_widths = c(2, .4))
+gridLegend
+```
+```{r}
+ggsave(gridLegend, filename = "../figures/phyloseq_JAN2020/DPCoA_indiv_samples_grid.svg", device = "svg", 
+       #useDingbats = FALSE,
+       height = 3, width = 11)
+```
+
+
+**Patient 59**  
+In this group of samples, the sample types are very distinguishable, and sample types cluster incredibly well. The variability captured by the first axis is 95.2% which is huge. Almost all the variability in this dataset is captured by two-axis space.  
+**Patient 62**  
+In this plot we can see that there is variability in the positves and negatives There is one sample in the Positves that is an outlier (Postive 2)  
+**Patient 68**  
+In this plot we can see that there is variability in the positives and negatives that make them hard to distinguish as groups. However, I need to test whether the variability within groups is greater than the variability between groups (I don't have confidence that this will turn out well at least for this sample)  
+**Overall**  
+The variability observed is most noticeable at the ASV level, and predictably reduced with reduced data complexity when taxa are agglomeraged at the genus level. Final plots are shown at the ASV level.   
+
+Reviewer 1 asked for us to show replicability in our methods through technical replicates, so I will use a distance metric (calc from DPCoA or bray and use adonis to test if there is a significant difference in centroids)  
+
+Filter out Original and Input samples:
+```{r}
+ord.colors.sorts <- c("#6C2215", "#D7462E", "#EBA194", "#28546D", "#8AC1BE", "#3A807E")
+```
+```{r}
+# Filtering parameter for minimum reads
+MINREADS <- 0
+SAMPLE_TYPE_KEEP <- c("Sort Positive", "Sort Negative")
+# Split dataset by patient number
+ps.patient59.sorts <- subset_samples(ps.filt.prop, PATIENT_NUM == "Patient_59" & 
+                               SAMPLE_TYPE_SIMPLE %in% SAMPLE_TYPE_KEEP) %>% 
+  filter_taxa(function(x) sum(x) > MINREADS, TRUE)
+ps.patient59.sorts
+
+ps.patient62.sorts <- subset_samples(ps.filt.prop, PATIENT_NUM == "Patient_62" &
+                               SAMPLE_TYPE_SIMPLE %in% SAMPLE_TYPE_KEEP) %>% 
+  filter_taxa(function(x) sum(x) > MINREADS, TRUE)
+ps.patient62.sorts
+
+ps.patient68.sorts <- subset_samples(ps.filt.prop, PATIENT_NUM == "Patient_68" &
+                               SAMPLE_TYPE_SIMPLE %in% SAMPLE_TYPE_KEEP) %>% 
+  filter_taxa(function(x) sum(x) > MINREADS, TRUE)
+ps.patient68.sorts
+```
+```{r fig.height = 3.5, fig.width = 12}
+ordplot59.sorts <- DPCoAPlot(ps.patient59.sorts) + 
+  scale_color_manual(values = ord.colors.sorts)
+ordplot62.sorts <- DPCoAPlot(ps.patient62.sorts) + 
+  scale_color_manual(values = ord.colors.sorts)
+ordplot68.sorts <- DPCoAPlot(ps.patient68.sorts) + 
+  scale_color_manual(values = ord.colors.sorts)
+
+grid.sorts <- plot_grid(ordplot59.sorts + theme(legend.position="none"),
+                  ordplot62.sorts + theme(legend.position="none"), 
+                  ordplot68.sorts + theme(legend.position="none"),
+                  align = "vh", hjust = -1, nrow = 1)
+# extract the legend from one of the plots
+legend.sorts <- get_legend(
+  # create some space to the left of the legend
+  ordplot59.sorts + theme(legend.box.margin = margin(0, 0, 0, 12))
+)
+# add the legend to the row we made earlier. Give it one-third of 
+# the width of one plot (via rel_widths).
+gridLegend.sorts <- plot_grid(grid.sorts, legend.sorts, rel_widths = c(2, .4))
+gridLegend.sorts
+```
+How to test groups are statistically significantly distinct from each other....Permanova, adonis, Mantel test
+
+### Adonis
+For adonis, we will be testing whether location explains a significant amount of the distances between the communities
+```{r}
+wuniDist59 <- phyloseq::distance(ps.patient59.prop, "wunifrac")
+samdf59 <- data.frame(sample_data(ps.patient59.prop))
+adonis(wuniDist59 ~ SAMPLE_TYPE_SIMPLE, data = samdf59)
+```
+
+```{r}
+wuniDist62 <- phyloseq::distance(ps.patient62.prop, "wunifrac")
+samdf62 <- data.frame(sample_data(ps.patient62.prop))
+adonis(wuniDist62 ~ SAMPLE_TYPE_SIMPLE, data = samdf62)
+```
+
+```{r}
+wuniDist68 <- phyloseq::distance(ps.patient68.prop, "wunifrac")
+samdf68 <- data.frame(sample_data(ps.patient68.prop))
+adonis(wuniDist68 ~ SAMPLE_TYPE_SIMPLE, data = samdf68)
+```
+
+```{r}
+DPCoAdist59 <- phyloseq::distance(ps.patient59.prop, "dpcoa")
+samdf59 <- data.frame(sample_data(ps.patient59.prop))
+adonis(DPCoAdist59 ~ SAMPLE_TYPE_SIMPLE, data = samdf59)
+```
+```{r}
+DPCoAdist62 <- phyloseq::distance(ps.patient62.prop, "dpcoa")
+samdf62 <- data.frame(sample_data(ps.patient62.prop))
+adonis(DPCoAdist62 ~ SAMPLE_TYPE_SIMPLE, data = samdf62)
+```
+```{r}
+DPCoAdist68 <- phyloseq::distance(ps.patient68.prop, "dpcoa")
+samdf68 <- data.frame(sample_data(ps.patient68.prop))
+adonis(DPCoAdist68 ~ SAMPLE_TYPE_SIMPLE, data = samdf68)
+```
+
+DPCoA and weighted unifrac distance matrices both produce comparable adonis results. **Patient 59** is the only sample giving significant results, which isn't surprising based on the MDS visualization.
+
+This brings up questions about how to deal with these samples to accurately move forward with analysis. For Sample 59, I have no problem concluding that averaging the taxa accross these samples at the ASV level is a good way to go. However, the outlier samples in the other two patient sample groups give me pause.
+
+I will proceed by calculating the mean and standard deviation for each ASV in the positive samples and the negative samples, keeping in mind that there is going to be variability in some of the taxa.
+
+
+## Fold change in taxa abundance 
+
+I'd like to visualize the differences in ASVs between sample types. To do this, I need to get the data into a format to work with. First, subset the three patient phyloseq datasets. 
+```{r}
+# Filtering parameter for minimum reads
+MINREADS <- 0
+# Split dataset by patient number
+ps.patient59 <- subset_samples(ps.unsuper.prevfilt.taxfilt, PATIENT_NUM == "Patient_59") %>% 
+  filter_taxa(function(x) sum(x) > MINREADS, TRUE)
+ps.patient59
+ps.patient62 <- subset_samples(ps.unsuper.prevfilt.taxfilt, PATIENT_NUM == "Patient_62") %>% 
+  filter_taxa(function(x) sum(x) > MINREADS, TRUE)
+ps.patient62
+ps.patient68 <- subset_samples(ps.unsuper.prevfilt.taxfilt, PATIENT_NUM == "Patient_68") %>% 
+  filter_taxa(function(x) sum(x) > MINREADS, TRUE)
+ps.patient68
+```
+Next, get the phyloseq otu table and tax table into a format we can work with. The function asv_tax_melt will create a dataframes out of the phyloseq object - one for ASVs ("OTUs"), one for the taxonomy, then, these tables will be combined so that the ASV, taxonomy, are represented in a single data frame in wide format (ASV/tax by rows, sample names and abundance as columns.)
+```{r}
+#Write function to operate on a phyloseq object
+asv_tax_melt <- function(physeq) {
+  #Get an OTU table with taxonomy in the second last row
+  otu <- as.data.frame(otu_table(physeq)) %>%
+    t() %>% #transpose so that ASVs are rows and samples are columns
+    tibble::as_tibble(rownames = "OTU")
+
+  # Get tax table
+  tax <- as.data.frame(physeq@tax_table@.Data) %>%
+    #tax_table(physeq) #%>%
+    tibble::as_tibble(rownames = "OTU")
+
+  # Combine OTU table and Taxa into a single object and ignore the -Genus_Number
+  otu_tax <- dplyr::left_join(otu, tax, by = "OTU") %>%
+    select(TaxNameCount, 
+           Original = contains("ori"), Input = contains("_IN"), 
+           Positive1 = contains("A1Pos"), Positive2 = contains("A2Pos"), Positive3 = contains("A3Pos"),
+           Negative1 = contains("A1neg"), Negative2 = contains("A2neg"), Negative3 = contains("A3neg"),
+           everything()) 
+}  
+```
+```{r}
+#Apply to phyloseq datasets
+pt59melt <- asv_tax_melt(ps.patient59)
+pt62melt <- asv_tax_melt(ps.patient62)
+pt68melt <- asv_tax_melt(ps.patient68)
+```
+Function to take sequence numbers and convert to relative abundances, then average/SD the relative abundances. Preliminarily, Remove any taxa that are both negative in the Original and Input samples.
+```{r}
+avg_relabund_calc <- function(x) {
+  otu_tax_calc_prop <- x %>%
+    # First filter out taxa that are not in either the Original or Input samples
+    filter(Original > 0) %>%
+    # Calculate the proportional abundance for each ASV
+    mutate(ori.prop = 100 * Original/sum(Original),
+           input.prop = 100 * Input/sum(Input),
+           pos1.prop = 100 * Positive1/sum(Positive1),
+           pos2.prop = 100 * Positive2/sum(Positive2),
+           pos3.prop = 100 * Positive3/sum(Positive3),
+           neg1.prop = 100 * Negative1/sum(Negative1),
+           neg2.prop = 100 * Negative2/sum(Negative2),
+           neg3.prop = 100 * Negative3/sum(Negative3))
+  # Define variables to calculate the mean rowwise
+  posReps <- quo(c(pos1.prop, pos2.prop, pos3.prop))
+  negReps <- quo(c(neg1.prop, neg2.prop, neg3.prop))
+# Calculate the mean and standard deviation of the proportions of each taxa for the positive and negative sort replicates
+  otu_tax_calc_prop_avg <-  otu_tax_calc_prop %>%
+    rowwise() %>%
+    mutate(pos.prop.mean = mean(!!posReps), 
+           pos.prop.sd = sd(!!posReps),
+           neg.prop.mean = mean(!!negReps), 
+           neg.prop.sd = sd(!!negReps)
+           )
+}
+```
+Apply this function to the newly created patient specific dataframes
+```{r}
+pt59meltPropAvg <- avg_relabund_calc(pt59melt)
+pt62meltPropAvg <- avg_relabund_calc(pt62melt)
+pt68meltPropAvg <- avg_relabund_calc(pt68melt)
+```
+
+```{r}
+write_csv(pt59meltPropAvg, "../data/phyloseq_Jan2020/pt59PropAverage.csv")
+write_csv(pt62meltPropAvg, "../data/phyloseq_Jan2020/pt62PropAverage.csv")
+write_csv(pt68meltPropAvg, "../data/phyloseq_Jan2020/pt68PropAverage.csv")
+```
+
+### Alternative plotting for relative abundance
+I'd like to just make a barplot of the relative abundances of the taxa in these datasets
+```{r}
+taxaBarPlot <- function(x) {
+  df <- x %>%
+    select(TaxNameCount, ori.prop,input.prop,pos.prop.mean, neg.prop.mean, OTU) %>%
+    gather(key = TYPE, value = PROPORTION, -TaxNameCount, -OTU) %>%
+    mutate(TYPE_PLOT = ifelse(TYPE == "ori.prop", "Original",
+                              ifelse(TYPE == "input.prop", "Input",
+                                     ifelse(TYPE == "pos.prop.mean", "Sort Positive", "Sort Negative")
+                                     )
+                              )
+           ) %>%
+    arrange(PROPORTION)
+  
+# some plotting things
+colors <- c("black", "grey30", "dodgerblue", "deeppink3")
+df$facetOrder = factor(df$TYPE_PLOT, levels = c("Original","Input","Sort Negative","Sort Positive"))
+
+  ggplot(df, mapping = aes(x = reorder(OTU, PROPORTION), y = PROPORTION, color = facetOrder, fill = facetOrder)) + 
+    geom_bar(position = "dodge", stat = "identity") +
+    coord_flip() +
+    facet_wrap(.~facetOrder, nrow = 1) + 
+    scale_color_manual(values = colors) +
+    scale_fill_manual(values = colors) +
+    scale_x_discrete(breaks = df$OTU, labels = df$TaxNameCount) +
+    theme_pubclean() +
+    theme(
+      #legend.position = "",
+      axis.text.x = element_text(angle = 90)
+    )
+}
+```
+```{r}
+taxaBarPlot(pt59meltPropAvg)
+taxaBarPlot(pt62meltPropAvg)
+taxaBarPlot(pt68meltPropAvg)
+```
+Or a lollipop plot
+```{r}
+taxaDotPlot <- function(x) {
+  data <- x %>%
+    select(TaxName, TaxNameCount, input.prop, pos.prop.mean, OTU) %>%
+    mutate(diff = pos.prop.mean-input.prop) %>%
+    mutate(log2diff = log2(diff)) %>%
+    arrange(diff) #%>% 
+  #mutate(OTU=factor(x, x))
+  
+  # Plot
+  ggplot(data) +
+    geom_segment( aes(x=reorder(OTU, diff), 
+                      xend=reorder(OTU, diff), 
+                      y=input.prop, yend=pos.prop.mean), color="grey") +
+    geom_point( aes(x=reorder(OTU, diff), y=input.prop), color="black", alpha = .5, size=3 ) +
+    geom_point( aes(x=reorder(OTU, diff), y=pos.prop.mean), color="#FF0000", alpha = .5, size=3 ) +
+    coord_flip() +
+    scale_x_discrete(breaks = data$OTU, labels = data$TaxNameCount) +
+    theme_pubclean() +
+    theme(
+      legend.position = "bottom",
+      axis.ticks = element_blank(),
+      axis.text.y = element_text(face = "italic"),
+    ) +
+    ggtitle("Relative Abundance of Input (grey) and Positive Sort (red)") +
+    xlab("ASV") +
+    ylab("Relative Abundance")
+}
+```
+```{r}
+pt59propdot <- taxaDotPlot(pt59meltPropAvg)
+pt59propdot
+pt62propdot <- taxaDotPlot(pt62meltPropAvg)
+pt62propdot
+pt68propdot <- taxaDotPlot(pt68meltPropAvg)
+pt68propdot
+```
+```{r}
+ggsave(pt59propdot, filename = "../figures/phyloseq_JAN2020/pt59_prop_dotplot_inputVsPos.png")
+ggsave(pt62propdot, filename = "../figures/phyloseq_JAN2020/pt62_prop_dotplot_inputVsPos.png")
+ggsave(pt68propdot, filename = "../figures/phyloseq_JAN2020/pt68_prop_dotplot_inputVsPos.png")
+```
+
+Red is the input and blue is the positive.
+### Comparing samples by fold change
+function to compare two samples by either fold change or log2fold change, and output either a dataframe or a plot
+```{r}
+compareSamples <- function(x,FC="FC", log2FC="log2FC", sampleA, sampleB, plot = c(TRUE,FALSE), plotY) {
+  df <- x %>% select(TaxName, TaxNameCount, sampleA, sampleB, OTU) #%>%
+  # Calculate the fold change between the test (B) and control (A) sample
+  df[[FC]] <- df[[sampleB]] / df[[sampleA]]
+  # Calculate the log2 fold change between the test (B) and control (A) sample
+  df[[log2FC]] <- log2(df[[FC]])
+  df <- df %>% 
+    mutate(colorname = ifelse(log2FC == "-Inf", "only in A", 
+                              ifelse(log2FC < 0, "decreased abundance", 
+                                     ifelse(log2FC > 0 & log2FC < 100, "increased abundance", 
+                                            ifelse(log2FC == "Inf", "only in sampleB", NA))))) %>%
+    mutate(colorhex = ifelse(log2FC == "-Inf", "#cdbfb1", 
+                             ifelse(log2FC < 0, "black", 
+                                    ifelse(log2FC > 0 & log2FC < 100, "deeppink3", 
+                                           ifelse(log2FC == "Inf", "#cdbfb1", NA))))) %>%
+    arrange(FC)
+  # Output - plot or dataframe
+  if (plot == TRUE){
+    # Plotting stuff
+    colors <- df$colorhex
+    names(colors) <- df$colorname
+    # plot
+    p <- ggplot(df, aes(x = reorder(OTU, -df[[plotY]]), y=df[[plotY]], color = colorname, fill = colorname
+    )) + 
+      geom_segment( aes(x=reorder(OTU, -df[[plotY]]), xend=reorder(OTU, -df[[plotY]]), 
+                        y=0, yend=df[[plotY]]), color = "black") +
+      geom_point(aes(fill = "colorname"), size = 2) +
+      coord_flip() +
+      scale_x_discrete(breaks = df$OTU, labels = df$TaxNameCount) +
+      scale_fill_manual(values=colors) +
+      scale_color_manual(values=colors) +
+      theme_pubclean(base_size = 10) +
+      theme(
+        axis.title = element_blank(),
+        legend.position = "none",
+        legend.title = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.y = element_text(color = "black"),
+        axis.text.x = element_text(color = "black")
+      ) #+ labs(y = plotY, x = "Amplicon Sequence Variant (ASV)")
+    prop.df <- df %>%
+      select(TaxNameCount, OTU, sampleA, sampleB, plotY) %>%
+      gather(key = TYPE, value = PROPORTION, -TaxNameCount, -OTU, -plotY) %>%
+      mutate(LOG_PROPORTION = (log(PROPORTION+1))) %>%
+      mutate(SQRT_PROPORTION = (sqrt(PROPORTION))) %>%
+      mutate(TYPE_PLOT = ifelse(TYPE == "ori.prop", "Original",
+                                ifelse(TYPE == "input.prop", "Input",
+                                       ifelse(TYPE == "pos.prop.mean", "Sort Positive", "Sort Negative"))))
+    # Heatmap of sqrt transformed relative abundances
+    p.heat <- ggplot(prop.df, aes(x = reorder(OTU, -prop.df[[plotY]]), y=TYPE_PLOT, fill = SQRT_PROPORTION)) +
+      geom_tile(color = "white", size = .7) +
+      coord_flip() +
+      scale_x_discrete(breaks = prop.df$OTU, labels = prop.df$TaxNameCount) +
+      scale_fill_distiller(palette = "Blues", direction = 1) +
+#      scale_fill_viridis() +
+      theme_pubclean(base_size = 10) +
+      theme(
+        plot.margin = margin(0,0,0,0, unit = "cm"),
+        legend.position = "right",
+        legend.title = element_blank(),
+        axis.text.y = element_blank(),
+        axis.title = element_blank(),
+        axis.ticks.y = element_blank(),
+      ) + guides(fill = guide_colourbar(barwidth=0.5))
+    # Plot fold change and heatmap together
+    plot_grid(p, p.heat, rel_widths = c(4,1), rel_heights = c(4, 1), align = "hv") #+
+              #theme(plot.margin = margin(2,2,2,2), "cm")
+  } else {
+    df
+  }
+}
+```
+
+### Fold Change between Input (A) and average Positive Sort (B)
+```{r}
+# Patient 59
+InPosFC59.plot <- compareSamples(x = pt59meltPropAvg,sampleA = "input.prop", sampleB = "pos.prop.mean", plot = TRUE, plotY = "FC")
+InPosFC59.df <- compareSamples(x = pt59meltPropAvg,sampleA = "input.prop", sampleB = "pos.prop.mean", plot = FALSE, plotY = "FC")
+# Patient 62
+InPosFC62.plot <- compareSamples(x = pt62meltPropAvg,sampleA = "input.prop", sampleB = "pos.prop.mean", plot = TRUE, plotY = "FC")
+InPosFC62.df <- compareSamples(x = pt62meltPropAvg,sampleA = "input.prop", sampleB = "pos.prop.mean", plot = FALSE, plotY = "FC")
+# Patient 68
+InPosFC68.plot <- compareSamples(x = pt68meltPropAvg,sampleA = "input.prop", sampleB = "pos.prop.mean", plot = TRUE, plotY = "FC")
+InPosFC68.df <- compareSamples(x = pt68meltPropAvg,sampleA = "input.prop", sampleB = "pos.prop.mean", plot = FALSE, plotY = "FC")
+```
+```{r}
+write_csv(InPosFC59.df, "../data/phyloseq_Jan2020/pt59PropFoldChange_InputVsPos.csv")
+write_csv(InPosFC62.df, "../data/phyloseq_Jan2020/pt62PropFoldChange_InputVsPos.csv")
+write_csv(InPosFC68.df, "../data/phyloseq_Jan2020/pt68PropFoldChange_InputVsPos.csv")
+```
+
+Plots
+```{r fig.height=2.2, fig.width=4.2} 
+#fig.height=2.2, fig.width=4.2
+InPosFC59.plot
+```
+```{r fig.height = 4.2, fig.width = 4.2}
+# fig.height = 4.2, fig.width = 4.2
+InPosFC62.plot
+```
+```{r fig.height = 3.2, fig.width = 4.2}
+# fig.height = 3.2, fig.width = 4.2
+InPosFC68.plot
+```
+I sqrt transformed the proportions for visualization purposes in the heatmap
+```{r}
+ggsave(InPosFC59.plot, filename = "../figures/phyloseq_JAN2020/foldChange59_InputvPos.svg", device = "svg", #useDingbats = FALSE, 
+       width = 4.2, height = 2.2, units = "in")
+ggsave(InPosFC62.plot, filename = "../figures/phyloseq_JAN2020/foldChange62_InputvPos.svg", device = "svg", #useDingbats = FALSE, 
+       width = 4.2, height = 4.2, units = "in")
+ggsave(InPosFC68.plot, filename = "../figures/phyloseq_JAN2020/foldChange68_InputvPos.svg", device = "svg", #useDingbats = FALSE, 
+       width = 4.2, height = 3.2, units = "in")
+```
+
+### Log2FC between Input (A) and average Positive Sort (B)
+```{r}
+# Patient 59
+InPoslog2FC59.plot <- compareSamples(x = pt59meltPropAvg,sampleA = "input.prop", sampleB = "pos.prop.mean", plot = TRUE, plotY = "log2FC")
+# Patient 62
+InPoslog2FC62.plot <- compareSamples(x = pt62meltPropAvg,sampleA = "input.prop", sampleB = "pos.prop.mean", plot = TRUE, plotY = "log2FC")
+# Patient 68
+InPoslog2FC68.plot <- compareSamples(x = pt68meltPropAvg,sampleA = "input.prop", sampleB = "pos.prop.mean", plot = TRUE, plotY = "log2FC")
+```
+
+```{r fig.width=4.2, fig.height = 3}
+InPoslog2FC59.plot
+```
+```{r fig.width=4.3, fig.height = 5}
+InPoslog2FC62.plot
+```
+```{r fig.width=4.2, fig.height = 4}
+#fig.width=4.2, fig.height = 4
+InPoslog2FC68.plot
+```
+
+```{r}
+ggsave(InPoslog2FC59.plot, filename = "../figures/phyloseq_JAN2020/log2foldChange59.pdf", device = "pdf", useDingbats = FALSE, 
+       width = 4.3, height = 3, units = "in")
+ggsave(InPoslog2FC62.plot, filename = "../figures/phyloseq_JAN2020/log2foldChange62.pdf", device = "pdf", useDingbats = FALSE, 
+       width = 4.3, height = 5, units = "in")
+ggsave(InPoslog2FC68.plot, filename = "../figures/phyloseq_JAN2020/log2foldChange68.pdf", device = "pdf", useDingbats = FALSE, 
+       width = 4.3, height = 4, units = "in")
+```
+
+
+### Fold Change between Negative (A) vs. Positive (B)
+```{r}
+# Patient 59
+NegPosFC59.plot <- compareSamples(x = pt59meltPropAvg, sampleA = "neg.prop.mean", sampleB = "pos.prop.mean", plot = TRUE, plotY = "FC")
+NegPosFC59.df <- compareSamples(x = pt59meltPropAvg, sampleA = "neg.prop.mean", sampleB = "pos.prop.mean", plot = FALSE, plotY = "FC")
+# Patient 62
+NegPosFC62.plot <- compareSamples(x = pt62meltPropAvg, sampleA = "neg.prop.mean", sampleB = "pos.prop.mean", plot = TRUE, plotY = "FC")
+NegPosFC62.df <- compareSamples(x = pt62meltPropAvg, sampleA = "neg.prop.mean", sampleB = "pos.prop.mean", plot = FALSE, plotY = "FC")
+# Patient 68
+NegPosFC68.plot <- compareSamples(x = pt68meltPropAvg, sampleA = "neg.prop.mean", sampleB = "pos.prop.mean", plot = TRUE, plotY = "FC")
+NegPosFC68.df <- compareSamples(x = pt68meltPropAvg, sampleA = "neg.prop.mean", sampleB = "pos.prop.mean", plot = FALSE, plotY = "FC")
+```
+
+```{r}
+write_csv(NegPosFC59.df, "../data/phyloseq_Jan2020/pt59PropFoldChange_NegVsPos.csv")
+write_csv(NegPosFC62.df, "../data/phyloseq_Jan2020/pt62PropFoldChangeNegVsPos.csv")
+write_csv(NegPosFC68.df, "../data/phyloseq_Jan2020/pt68PropFoldChangeNegVsPos.csv")
+```
+
+
+```{r}
+NegPosFC59.plot
+NegPosFC62.plot
+NegPosFC68.plot
+```
+```{r}
+ggsave(NegPosFC59.plot, filename = "../figures/phyloseq_JAN2020/foldChange59_NegvPos.svg", device = "svg", #useDingbats = FALSE, 
+       width = 4.2, height = 2.2, units = "in")
+ggsave(NegPosFC62.plot, filename = "../figures/phyloseq_JAN2020/foldChange62_NegvPos.svg", device = "svg", #useDingbats = FALSE, 
+       width = 4.2, height = 4.2, units = "in")
+ggsave(NegPosFC68.plot, filename = "../figures/phyloseq_JAN2020/foldChange68_NegvPos.svg", device = "svg", #useDingbats = FALSE, 
+       width = 4.2, height = 3.2, units = "in")
+```
+
+### Log2-Fold Change between Negative (A) vs. Positive (B)
+```{r}
+# Patient 59
+NegPosLog2FC59.plot <- compareSamples(x = pt59meltPropAvg, sampleA = "neg.prop.mean", sampleB = "pos.prop.mean", plot = TRUE, plotY = "log2FC")
+# Patient 62
+NegPosLog2FC62.plot <- compareSamples(x = pt62meltPropAvg, sampleA = "neg.prop.mean", sampleB = "pos.prop.mean", plot = TRUE, plotY = "log2FC")
+# Patient 68
+NegPosLog2FC68.plot <- compareSamples(x = pt68meltPropAvg, sampleA = "neg.prop.mean", sampleB = "pos.prop.mean", plot = TRUE, plotY = "log2FC")
+```
+
+```{r fig.width=4.2, fig.height = 3}
+ggsave(NegPosLog2FC59.plot, filename = "../figures/phyloseq_JAN2020/log2foldchangeNegPos59.svg", width = 4.2, height = 3, device = "svg")
+```
+
+
+
+
+
+### Fold Change between Input (A) vs. Negative (B)
+```{r}
+# Patient 59
+InputNegFC59.plot <- compareSamples(x = pt59meltPropAvg, sampleA = "input.prop", sampleB = "neg.prop.mean", plot = TRUE, plotY = "FC")
+InputNegFC59.df <- compareSamples(x = pt59meltPropAvg, sampleA = "input.prop", sampleB = "neg.prop.mean", plot = FALSE, plotY = "FC")
+# Patient 62
+InputNegFC62.plot <- compareSamples(x = pt62meltPropAvg, sampleA = "input.prop", sampleB = "neg.prop.mean", plot = TRUE, plotY = "FC")
+InputNegFC62.df <- compareSamples(x = pt62meltPropAvg, sampleA = "input.prop", sampleB = "neg.prop.mean", plot = FALSE, plotY = "FC")
+# Patient 68
+InputNegFC68.plot <- compareSamples(x = pt68meltPropAvg, sampleA = "input.prop", sampleB = "neg.prop.mean", plot = TRUE, plotY = "FC")
+InputNegFC68.df <- compareSamples(x = pt68meltPropAvg, sampleA = "input.prop", sampleB = "neg.prop.mean", plot = FALSE, plotY = "FC")
+```
+
+```{r}
+write_csv(InputNegFC59.df, "../data/phyloseq_Jan2020/pt59PropFoldChange_InputVsNeg.csv")
+write_csv(InputNegFC62.df, "../data/phyloseq_Jan2020/pt62PropFoldChangeN_InputVsNeg.csv")
+write_csv(InputNegFC68.df, "../data/phyloseq_Jan2020/pt68PropFoldChange_InputVsNeg.csv")
+```
+
+```{r fig.width=8, fig.height = 3}
+InputNegFC59.plot
+```
+```{r fig.width=4.3, fig.height = 5}
+InputNegFC62.plot
+```
+```{r fig.height = 3.2, fig.width = 4.2}
+InputNegFC68.plot
+```
+
+```{r}
+ggsave(InputNegFC59.plot, filename = "../figures/phyloseq_JAN2020/foldChange59_InputvNeg.svg", device = "svg",
+       width = 4.2, height = 2.2, units = "in")
+ggsave(InputNegFC62.plot, filename = "../figures/phyloseq_JAN2020/foldChange62_InputvNeg.svg", device = "svg",
+       width = 4.2, height = 4.2, units = "in")
+ggsave(InputNegFC68.plot, filename = "../figures/phyloseq_JAN2020/foldChange68_InputvNeg.svg", device = "svg",
+       width = 4.2, height = 3.2, units = "in")
+```
+
+```{r}
+sessionInfo()
+```
